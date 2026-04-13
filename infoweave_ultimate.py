@@ -9,7 +9,7 @@ Description:
     InfoWeave Ultimate 是一款顶级信息收集与漏洞预检工具，旨在模拟 APT 级别的侦察能力。
     本脚本在完全不使用任何 API Key 的前提下，集成了证书透明度挖掘、历史快照回溯、
     ASN 资产映射、隐蔽扫描、云原生安全检测及敏感路径探测等核心模块。
-    [优化版]：增加了分页拉取、超时控制、并发处理及键盘中断响应，解决大型目标卡死问题。
+    [修复版]：修复了命令行参数 --no-wayback 不生效的问题，并优化了域名输入逻辑。
 Legal Disclaimer: 
     严禁将本脚本用于任何未经授权的攻击行为。使用者需对自己的行为承担全部法律责任。
 """
@@ -56,9 +56,8 @@ class InfoWeaveUltimate:
     def log(self, tag, message):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {message}")
 
-    # 1. 证书透明度挖掘 (crt.sh - 增加超时与重试)
+    # 1. 证书透明度挖掘 (crt.sh)
     def fetch_ct_logs(self):
-        if self.args.no_ct: return
         self.log("CT", f"正在从 crt.sh 挖掘 {self.domain} 的证书记录...")
         try:
             url = f"https://crt.sh/?q={self.domain}&output=json"
@@ -69,7 +68,6 @@ class InfoWeaveUltimate:
                     name = entry.get('common_name', '')
                     if name.endswith(self.domain):
                         self.subdomains.add(name.replace("*.", ""))
-                    # 检查 SAN 字段
                     alt_names = entry.get('name_value', '').split('\n')
                     for alt in alt_names:
                         if alt.endswith(self.domain):
@@ -78,9 +76,8 @@ class InfoWeaveUltimate:
         except Exception as e:
             self.log("!", f"crt.sh 抓取失败: {e}")
 
-    # 2. 历史快照回溯 (Wayback Machine - 增加分页与进度显示)
+    # 2. 历史快照回溯 (Wayback Machine)
     def fetch_wayback_urls(self):
-        if self.args.no_wayback: return
         self.log("WAYBACK", f"正在从 Wayback Machine 分页回溯历史 URL...")
         page_size = 5000
         start = 0
@@ -93,7 +90,7 @@ class InfoWeaveUltimate:
                 if r.status_code != 200: break
                 
                 data = r.json()
-                if len(data) <= 1: break # 只有 header 或为空
+                if len(data) <= 1: break
                 
                 for entry in data[1:]:
                     original_url = entry[2]
@@ -107,11 +104,11 @@ class InfoWeaveUltimate:
                 total_found += batch_count
                 self.log("WAYBACK", f"已获取 {total_found} 条历史记录，继续拉取...")
                 
-                if batch_count < page_size: break # 最后一页
+                if batch_count < page_size: break
                 start += page_size
-                time.sleep(0.5) # 礼貌延迟
+                time.sleep(0.5)
                 
-                if total_found > 50000: # 保护机制：防止政府网站数据量过大卡死
+                if total_found > 50000:
                     self.log("WAYBACK", "已达到 50,000 条上限，停止拉取以保证性能")
                     break
             except KeyboardInterrupt:
@@ -121,7 +118,7 @@ class InfoWeaveUltimate:
                 self.log("!", f"Wayback 分页拉取中断: {e}")
                 break
 
-    # 3. ASN 资产映射与反向 DNS (并发处理)
+    # 3. ASN 资产映射与反向 DNS
     def map_asn_and_ptr(self):
         self.log("ASN", "正在并发进行 ASN 映射与反向 DNS 查询...")
         ips = list(self.found_ips.keys())
@@ -130,7 +127,6 @@ class InfoWeaveUltimate:
             try:
                 ptr = socket.gethostbyaddr(ip)[0]
                 self.found_ips[ip]["ptr"] = ptr
-                # 简单 whois 模拟
                 cmd = f"whois {ip} | grep -iE 'origin|ASNumber|Organization' | head -n 3"
                 whois_out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=5).decode()
                 self.found_ips[ip]["asn_info"] = whois_out.strip()
@@ -139,14 +135,13 @@ class InfoWeaveUltimate:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(process_ip, ips)
 
-    # 4. 隐蔽扫描与规避 (Nmap 增强)
+    # 4. 隐蔽扫描与规避
     def stealth_scan(self):
         self.log("STEALTH", "正在启动隐蔽扫描 (分片与诱饵技术)...")
         for ip, data in self.found_ips.items():
             if data["cdn"]: continue
             self.log("NMAP", f"隐蔽探测目标: {ip}")
             try:
-                # 增加超时控制
                 cmd = ["nmap", "-sS", "-sV", "-f", "-D", "RND:5", "--source-port", "53", "-p", TCP_PORTS, "--open", "--host-timeout", "5m", ip]
                 output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=300).decode()
                 
@@ -158,7 +153,7 @@ class InfoWeaveUltimate:
                 self.log("!", f"Nmap 扫描 {ip} 超时，跳过")
             except: pass
 
-    # 5. 云原生与容器安全探测 (并发)
+    # 5. 云原生与容器安全探测
     def cloud_container_audit(self):
         self.log("AUDIT", "正在探测云原生与容器暴露风险...")
         targets = []
@@ -166,14 +161,12 @@ class InfoWeaveUltimate:
             if not data["cdn"]: targets.append(ip)
         
         def check_target(ip):
-            # K8s
             for port in ["6443", "10250"]:
                 try:
                     r = requests.get(f"https://{ip}:{port}/version", verify=False, timeout=3)
                     if r.status_code == 200:
                         self.found_ips[ip]["vulns"].append({"name": f"K8s API Exposure ({port})", "severity": "critical"})
                 except: pass
-            # Docker
             try:
                 r = requests.get(f"http://{ip}:2375/version", timeout=3)
                 if r.status_code == 200:
@@ -185,7 +178,6 @@ class InfoWeaveUltimate:
 
     # 6. 自动化漏洞扫描 (Nuclei)
     def run_nuclei(self):
-        if self.args.no_nuclei: return
         self.log("NUCLEI", "正在启动 Nuclei 深度扫描...")
         target_file = "ultimate_targets.txt"
         with open(target_file, "w") as f:
@@ -231,8 +223,16 @@ class InfoWeaveUltimate:
                 self.subdomains.update([s.strip() for s in res if s.strip()])
             except: pass
             
-            self.fetch_ct_logs()
-            self.fetch_wayback_urls()
+            # 修复：严格根据参数决定是否执行模块
+            if not self.args.no_ct:
+                self.fetch_ct_logs()
+            else:
+                self.log("SKIP", "已跳过 crt.sh 模块")
+
+            if not self.args.no_wayback:
+                self.fetch_wayback_urls()
+            else:
+                self.log("SKIP", "已跳过 Wayback 模块")
             
             # 解析 IP 并识别 CDN
             self.log("RESOLVE", f"正在解析 {len(self.subdomains)} 个子域名...")
@@ -243,8 +243,6 @@ class InfoWeaveUltimate:
                         self.found_ips[ip] = {"cdn": False, "subdomains": [], "ports": {}, "vulns": []}
                     if sub not in self.found_ips[ip]["subdomains"]:
                         self.found_ips[ip]["subdomains"].append(sub)
-                    
-                    # 简单 CDN 识别
                     if any(kw in sub for kw in CDN_KEYWORDS):
                         self.found_ips[ip]["cdn"] = True
                 except: continue
@@ -252,7 +250,12 @@ class InfoWeaveUltimate:
             self.map_asn_and_ptr()
             self.stealth_scan()
             self.cloud_container_audit()
-            self.run_nuclei()
+            
+            if not self.args.no_nuclei:
+                self.run_nuclei()
+            else:
+                self.log("SKIP", "已跳过 Nuclei 扫描")
+
             self.save_report()
             
         except KeyboardInterrupt:
@@ -269,7 +272,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-nuclei", action="store_true", help="跳过 Nuclei 扫描")
     args = parser.parse_args()
 
-    target = args.domain or input("输入目标域名: ").strip()
+    # 修复：如果命令行已提供域名，则不再弹出 input()
+    target = args.domain
+    if not target:
+        target = input("输入目标域名: ").strip()
+    
     if target:
         scanner = InfoWeaveUltimate(target, args)
         scanner.run()
