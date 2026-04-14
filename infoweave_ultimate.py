@@ -8,10 +8,11 @@ Disclaimer: 仅用于教育和授权测试目的 (For educational and authorized
 Description: 
     InfoWeave Ultimate (APT Edition) 是一款国际顶级信息收集与侦察工具。
     本脚本在完全不使用任何 API Key 的前提下，集成了以下专精模块：
-    1. OSINT 深度关联：SPF/MX 记录解析、GitHub 敏感信息爬虫、Wayback 历史回溯。
+    1. OSINT 深度关联：SPF/MX 记录解析、GitHub 敏感信息探测、Wayback 历史回溯。
     2. 网络空间测绘：C 段 PTR 反向解析、ASN 资产映射、Favicon Hash 关联。
     3. 隐蔽性与规避：分片扫描、诱饵伪装、动态 User-Agent 池。
     4. 云原生与供应链：S3/Azure Bucket 爆破、K8s/Docker API 审计。
+    [优化版]：增加了依赖检查、增强了错误处理、优化了子域名解析逻辑。
 Legal Disclaimer: 
     严禁将本脚本用于任何未经授权的攻击行为。使用者需对自己的行为承担全部法律责任。
 """
@@ -53,7 +54,7 @@ class InfoWeaveUltimate:
     def __init__(self, domain, args):
         self.domain = domain
         self.args = args
-        self.subdomains = set()
+        self.subdomains = {domain}
         self.found_ips = {} # {ip: {"cdn": bool, "subdomains": [], "ports": {}, "vulns": [], "asn": "", "ptr": ""}}
         self.cloud_buckets = set()
         self.results = {
@@ -70,47 +71,55 @@ class InfoWeaveUltimate:
     def get_headers(self):
         return {"User-Agent": random.choice(USER_AGENTS)}
 
-    # 1. SPF/MX 记录深度解析 (发现隐藏 IP 段)
+    def check_dependencies(self):
+        deps = ["nmap", "subfinder", "nuclei", "dig", "whois"]
+        missing = []
+        for dep in deps:
+            if subprocess.call(["which", dep], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                missing.append(dep)
+        if missing:
+            self.log("!", f"缺少必要依赖: {', '.join(missing)}。部分功能可能受限。")
+
+    # 1. SPF/MX 记录深度解析
     def analyze_spf_mx(self):
         self.log("SPF", f"正在解析 {self.domain} 的 SPF/MX 记录...")
         try:
             # 获取 MX 记录
-            cmd = f"dig MX {self.domain} +short"
-            mx_records = subprocess.check_output(cmd, shell=True).decode().splitlines()
+            mx_cmd = ["dig", "MX", self.domain, "+short"]
+            mx_records = subprocess.check_output(mx_cmd, stderr=subprocess.DEVNULL).decode().splitlines()
             for mx in mx_records:
                 self.log("MX", f"发现邮件服务器: {mx}")
             
             # 获取 SPF 记录
-            cmd = f"dig TXT {self.domain} +short"
-            txt_records = subprocess.check_output(cmd, shell=True).decode().splitlines()
+            txt_cmd = ["dig", "TXT", self.domain, "+short"]
+            txt_records = subprocess.check_output(txt_cmd, stderr=subprocess.DEVNULL).decode().splitlines()
             for txt in txt_records:
                 if "v=spf1" in txt:
                     self.log("SPF", f"发现 SPF 记录: {txt}")
-                    # 提取 ip4 段
                     ip4_ranges = re.findall(r'ip4:([^\s]+)', txt)
                     for r in ip4_ranges:
                         self.log("SPF-IP", f"发现关联 IP 段: {r}")
-        except: pass
+        except Exception as e:
+            self.log("!", f"SPF/MX 解析失败: {e}")
 
-    # 2. GitHub 敏感信息探测 (无需 API Key)
+    # 2. GitHub 敏感信息探测
     def github_recon(self):
-        self.log("GITHUB", f"正在 GitHub 搜索 {self.domain} 相关的敏感信息泄露...")
+        self.log("GITHUB", f"正在探测 GitHub 敏感信息泄露...")
         keywords = ["password", "secret", "token", "config", "key"]
         for kw in keywords:
             try:
-                # 模拟搜索 URL
                 search_url = f"https://github.com/search?q={self.domain}+{kw}&type=code"
                 r = requests.get(search_url, headers=self.get_headers(), timeout=self.args.timeout)
-                if "Sign in" in r.text:
-                    self.log("GITHUB", "由于未登录，GitHub 搜索受限，跳过深度爬取")
-                    break
-                if r.status_code == 200:
+                if r.status_code == 200 and "Sign in" not in r.text:
                     self.log("GITHUB", f"发现潜在泄露页面: {search_url}")
+                elif "Sign in" in r.text:
+                    self.log("GITHUB", "GitHub 搜索受限 (需要登录)，跳过")
+                    break
             except: pass
 
-    # 3. C 段 PTR 反向解析 (资产映射专精)
+    # 3. C 段 PTR 反向解析
     def c_class_ptr_scan(self):
-        self.log("PTR", "正在对发现的 IP 进行 C 段反向解析...")
+        self.log("PTR", "正在进行 C 段反向解析资产映射...")
         target_subnets = set()
         for ip in self.found_ips:
             if not self.found_ips[ip]["cdn"]:
@@ -132,28 +141,26 @@ class InfoWeaveUltimate:
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 executor.map(reverse_dns, ips_to_scan)
 
-    # 4. 云存储桶爆破 (S3/Azure)
+    # 4. 云存储桶爆破
     def cloud_bucket_brute(self):
-        self.log("CLOUD", "正在爆破关联的云存储桶 (S3/Azure)...")
+        self.log("CLOUD", "正在爆破关联的云存储桶...")
         keywords = [self.domain.split('.')[0], self.domain.replace('.', '-'), self.domain.replace('.', '')]
         suffixes = ["backup", "data", "test", "prod", "public", "private", "dev", "staging"]
         
         def check_bucket(name):
             # S3
-            s3_url = f"https://{name}.s3.amazonaws.com"
             try:
-                r = requests.get(s3_url, timeout=3)
+                r = requests.get(f"https://{name}.s3.amazonaws.com", timeout=5)
                 if r.status_code != 404:
-                    self.log("BUCKET", f"发现 S3 存储桶: {s3_url} (Status: {r.status_code})")
-                    self.cloud_buckets.add(s3_url)
+                    self.log("BUCKET", f"发现 S3: {name}.s3.amazonaws.com (Status: {r.status_code})")
+                    self.cloud_buckets.add(f"s3://{name}")
             except: pass
             # Azure
-            az_url = f"https://{name}.blob.core.windows.net"
             try:
-                r = requests.get(az_url, timeout=3)
+                r = requests.get(f"https://{name}.blob.core.windows.net", timeout=5)
                 if r.status_code != 404:
-                    self.log("BUCKET", f"发现 Azure Blob: {az_url} (Status: {r.status_code})")
-                    self.cloud_buckets.add(az_url)
+                    self.log("BUCKET", f"发现 Azure: {name}.blob.core.windows.net (Status: {r.status_code})")
+                    self.cloud_buckets.add(f"azure://{name}")
             except: pass
 
         bucket_names = set(keywords)
@@ -165,9 +172,9 @@ class InfoWeaveUltimate:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(check_bucket, list(bucket_names))
 
-    # 5. 证书透明度挖掘 (crt.sh)
+    # 5. 证书透明度挖掘
     def fetch_ct_logs(self):
-        self.log("CT", f"正在从 crt.sh 挖掘 {self.domain} 的证书记录...")
+        self.log("CT", f"正在从 crt.sh 挖掘证书记录...")
         try:
             url = f"https://crt.sh/?q={self.domain}&output=json"
             r = requests.get(url, timeout=self.args.timeout, verify=False)
@@ -181,13 +188,13 @@ class InfoWeaveUltimate:
                     for alt in alt_names:
                         if alt.endswith(self.domain):
                             self.subdomains.add(alt.replace("*.", ""))
-                self.log("CT", f"证书日志分析完成，当前共发现 {len(self.subdomains)} 个子域名")
+                self.log("CT", f"当前共发现 {len(self.subdomains)} 个子域名")
         except Exception as e:
             self.log("!", f"crt.sh 抓取失败: {e}")
 
-    # 6. 历史快照回溯 (Wayback Machine)
+    # 6. 历史快照回溯
     def fetch_wayback_urls(self):
-        self.log("WAYBACK", f"正在从 Wayback Machine 分页回溯历史 URL...")
+        self.log("WAYBACK", f"正在从 Wayback Machine 回溯历史 URL...")
         page_size = 5000
         start = 0
         total_found = 0
@@ -215,12 +222,11 @@ class InfoWeaveUltimate:
 
     # 7. 隐蔽扫描与规避
     def stealth_scan(self):
-        self.log("STEALTH", "正在启动隐蔽扫描 (分片与诱饵技术)...")
+        self.log("STEALTH", "正在启动隐蔽扫描...")
         for ip, data in self.found_ips.items():
             if data["cdn"]: continue
-            self.log("NMAP", f"隐蔽探测目标: {ip}")
+            self.log("NMAP", f"探测目标: {ip}")
             try:
-                # -f: 分片, -D RND:5: 诱饵, -sS: SYN 扫描
                 cmd = ["nmap", "-sS", "-sV", "-f", "-D", "RND:5", "--source-port", "53", "-p", TCP_PORTS, "--open", "--host-timeout", "5m", ip]
                 output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=300).decode()
                 matches = re.findall(r"(\d+)/tcp\s+open\s+([^\s]+)\s+(.*)", output)
@@ -229,7 +235,7 @@ class InfoWeaveUltimate:
                     self.log("OPEN", f"{ip}:{port} -> {service}")
             except: pass
 
-    # 8. 自动化漏洞扫描 (Nuclei)
+    # 8. 自动化漏洞扫描
     def run_nuclei(self):
         self.log("NUCLEI", "正在启动 Nuclei 深度扫描...")
         target_file = "ultimate_targets.txt"
@@ -266,6 +272,7 @@ class InfoWeaveUltimate:
         self.log("DONE", f"终极报告已生成: {self.output_file}")
 
     def run(self):
+        self.check_dependencies()
         try:
             self.analyze_spf_mx()
             self.github_recon()
@@ -292,9 +299,11 @@ class InfoWeaveUltimate:
                     if any(kw in sub for kw in CDN_KEYWORDS): self.found_ips[ip]["cdn"] = True
                 except: continue
             
-            self.c_class_ptr_scan()
-            self.stealth_scan()
-            if not self.args.no_nuclei: self.run_nuclei()
+            if self.found_ips:
+                self.c_class_ptr_scan()
+                self.stealth_scan()
+                if not self.args.no_nuclei: self.run_nuclei()
+            
             self.save_report()
             
         except KeyboardInterrupt:
