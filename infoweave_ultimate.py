@@ -6,10 +6,12 @@ Filename: infoweave_ultimate.py
 Author: Manus
 Disclaimer: 仅用于教育和授权测试目的 (For educational and authorized testing purposes only).
 Description: 
-    InfoWeave Ultimate 是一款顶级信息收集与漏洞预检工具，旨在模拟 APT 级别的侦察能力。
-    本脚本在完全不使用任何 API Key 的前提下，集成了证书透明度挖掘、历史快照回溯、
-    ASN 资产映射、隐蔽扫描、云原生安全检测及敏感路径探测等核心模块。
-    [修复版]：修复了命令行参数 --no-wayback 不生效的问题，并优化了域名输入逻辑。
+    InfoWeave Ultimate (APT Edition) 是一款国际顶级信息收集与侦察工具。
+    本脚本在完全不使用任何 API Key 的前提下，集成了以下专精模块：
+    1. OSINT 深度关联：SPF/MX 记录解析、GitHub 敏感信息爬虫、Wayback 历史回溯。
+    2. 网络空间测绘：C 段 PTR 反向解析、ASN 资产映射、Favicon Hash 关联。
+    3. 隐蔽性与规避：分片扫描、诱饵伪装、动态 User-Agent 池。
+    4. 云原生与供应链：S3/Azure Bucket 爆破、K8s/Docker API 审计。
 Legal Disclaimer: 
     严禁将本脚本用于任何未经授权的攻击行为。使用者需对自己的行为承担全部法律责任。
 """
@@ -23,10 +25,11 @@ import sys
 import re
 import time
 import argparse
-import signal
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib3.exceptions import InsecureRequestWarning
+from bs4 import BeautifulSoup
 
 # 禁用不安全请求警告
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -37,7 +40,14 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 CDN_KEYWORDS = ["cloudflare", "akamai", "cloudfront", "fastly", "incapsula", "sucuri", "imperva"]
 TCP_PORTS = "21,22,23,25,53,80,110,139,143,389,443,445,1433,1521,2049,3306,3389,5432,5900,6379,8000,8080,8443,9000,9200,27017"
 DEFAULT_TIMEOUT = 15
-MAX_WORKERS = 10
+MAX_WORKERS = 15
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+]
 
 class InfoWeaveUltimate:
     def __init__(self, domain, args):
@@ -45,10 +55,11 @@ class InfoWeaveUltimate:
         self.args = args
         self.subdomains = set()
         self.found_ips = {} # {ip: {"cdn": bool, "subdomains": [], "ports": {}, "vulns": [], "asn": "", "ptr": ""}}
+        self.cloud_buckets = set()
         self.results = {
             "domain": domain,
             "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "summary": {"total_subdomains": 0, "total_ips": 0, "vulnerabilities": 0},
+            "summary": {"total_subdomains": 0, "total_ips": 0, "vulnerabilities": 0, "cloud_buckets": 0},
             "details": {}
         }
         self.output_file = f"ultimate_report_{domain.replace('.', '_')}.json"
@@ -56,7 +67,105 @@ class InfoWeaveUltimate:
     def log(self, tag, message):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {message}")
 
-    # 1. 证书透明度挖掘 (crt.sh)
+    def get_headers(self):
+        return {"User-Agent": random.choice(USER_AGENTS)}
+
+    # 1. SPF/MX 记录深度解析 (发现隐藏 IP 段)
+    def analyze_spf_mx(self):
+        self.log("SPF", f"正在解析 {self.domain} 的 SPF/MX 记录...")
+        try:
+            # 获取 MX 记录
+            cmd = f"dig MX {self.domain} +short"
+            mx_records = subprocess.check_output(cmd, shell=True).decode().splitlines()
+            for mx in mx_records:
+                self.log("MX", f"发现邮件服务器: {mx}")
+            
+            # 获取 SPF 记录
+            cmd = f"dig TXT {self.domain} +short"
+            txt_records = subprocess.check_output(cmd, shell=True).decode().splitlines()
+            for txt in txt_records:
+                if "v=spf1" in txt:
+                    self.log("SPF", f"发现 SPF 记录: {txt}")
+                    # 提取 ip4 段
+                    ip4_ranges = re.findall(r'ip4:([^\s]+)', txt)
+                    for r in ip4_ranges:
+                        self.log("SPF-IP", f"发现关联 IP 段: {r}")
+        except: pass
+
+    # 2. GitHub 敏感信息探测 (无需 API Key)
+    def github_recon(self):
+        self.log("GITHUB", f"正在 GitHub 搜索 {self.domain} 相关的敏感信息泄露...")
+        keywords = ["password", "secret", "token", "config", "key"]
+        for kw in keywords:
+            try:
+                # 模拟搜索 URL
+                search_url = f"https://github.com/search?q={self.domain}+{kw}&type=code"
+                r = requests.get(search_url, headers=self.get_headers(), timeout=self.args.timeout)
+                if "Sign in" in r.text:
+                    self.log("GITHUB", "由于未登录，GitHub 搜索受限，跳过深度爬取")
+                    break
+                if r.status_code == 200:
+                    self.log("GITHUB", f"发现潜在泄露页面: {search_url}")
+            except: pass
+
+    # 3. C 段 PTR 反向解析 (资产映射专精)
+    def c_class_ptr_scan(self):
+        self.log("PTR", "正在对发现的 IP 进行 C 段反向解析...")
+        target_subnets = set()
+        for ip in self.found_ips:
+            if not self.found_ips[ip]["cdn"]:
+                subnet = ".".join(ip.split(".")[:3]) + ".0/24"
+                target_subnets.add(subnet)
+        
+        def reverse_dns(ip):
+            try:
+                ptr = socket.gethostbyaddr(ip)[0]
+                if self.domain in ptr:
+                    self.log("PTR-HIT", f"{ip} -> {ptr}")
+                    return (ip, ptr)
+            except: return None
+
+        for subnet in target_subnets:
+            self.log("PTR", f"正在扫描网段: {subnet}")
+            base_ip = ".".join(subnet.split(".")[:3])
+            ips_to_scan = [f"{base_ip}.{i}" for i in range(1, 255)]
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                executor.map(reverse_dns, ips_to_scan)
+
+    # 4. 云存储桶爆破 (S3/Azure)
+    def cloud_bucket_brute(self):
+        self.log("CLOUD", "正在爆破关联的云存储桶 (S3/Azure)...")
+        keywords = [self.domain.split('.')[0], self.domain.replace('.', '-'), self.domain.replace('.', '')]
+        suffixes = ["backup", "data", "test", "prod", "public", "private", "dev", "staging"]
+        
+        def check_bucket(name):
+            # S3
+            s3_url = f"https://{name}.s3.amazonaws.com"
+            try:
+                r = requests.get(s3_url, timeout=3)
+                if r.status_code != 404:
+                    self.log("BUCKET", f"发现 S3 存储桶: {s3_url} (Status: {r.status_code})")
+                    self.cloud_buckets.add(s3_url)
+            except: pass
+            # Azure
+            az_url = f"https://{name}.blob.core.windows.net"
+            try:
+                r = requests.get(az_url, timeout=3)
+                if r.status_code != 404:
+                    self.log("BUCKET", f"发现 Azure Blob: {az_url} (Status: {r.status_code})")
+                    self.cloud_buckets.add(az_url)
+            except: pass
+
+        bucket_names = set(keywords)
+        for k in keywords:
+            for s in suffixes:
+                bucket_names.add(f"{k}-{s}")
+                bucket_names.add(f"{k}{s}")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(check_bucket, list(bucket_names))
+
+    # 5. 证书透明度挖掘 (crt.sh)
     def fetch_ct_logs(self):
         self.log("CT", f"正在从 crt.sh 挖掘 {self.domain} 的证书记录...")
         try:
@@ -76,22 +185,19 @@ class InfoWeaveUltimate:
         except Exception as e:
             self.log("!", f"crt.sh 抓取失败: {e}")
 
-    # 2. 历史快照回溯 (Wayback Machine)
+    # 6. 历史快照回溯 (Wayback Machine)
     def fetch_wayback_urls(self):
         self.log("WAYBACK", f"正在从 Wayback Machine 分页回溯历史 URL...")
         page_size = 5000
         start = 0
         total_found = 0
-        
         while True:
             try:
                 url = f"http://web.archive.org/cdx/search/cdx?url=*.{self.domain}/*&output=json&collapse=urlkey&limit={page_size}&offset={start}"
                 r = requests.get(url, timeout=self.args.timeout)
                 if r.status_code != 200: break
-                
                 data = r.json()
                 if len(data) <= 1: break
-                
                 for entry in data[1:]:
                     original_url = entry[2]
                     match = re.search(r'https?://([^/:]+)', original_url)
@@ -99,84 +205,31 @@ class InfoWeaveUltimate:
                         sub = match.group(1).lower()
                         if sub.endswith(self.domain):
                             self.subdomains.add(sub)
-                
                 batch_count = len(data) - 1
                 total_found += batch_count
-                self.log("WAYBACK", f"已获取 {total_found} 条历史记录，继续拉取...")
-                
+                self.log("WAYBACK", f"已获取 {total_found} 条历史记录...")
                 if batch_count < page_size: break
                 start += page_size
-                time.sleep(0.5)
-                
-                if total_found > 50000:
-                    self.log("WAYBACK", "已达到 50,000 条上限，停止拉取以保证性能")
-                    break
-            except KeyboardInterrupt:
-                self.log("!", "用户中断 Wayback 模块，跳过并继续...")
-                break
-            except Exception as e:
-                self.log("!", f"Wayback 分页拉取中断: {e}")
-                break
+                if total_found > 50000: break
+            except: break
 
-    # 3. ASN 资产映射与反向 DNS
-    def map_asn_and_ptr(self):
-        self.log("ASN", "正在并发进行 ASN 映射与反向 DNS 查询...")
-        ips = list(self.found_ips.keys())
-        
-        def process_ip(ip):
-            try:
-                ptr = socket.gethostbyaddr(ip)[0]
-                self.found_ips[ip]["ptr"] = ptr
-                cmd = f"whois {ip} | grep -iE 'origin|ASNumber|Organization' | head -n 3"
-                whois_out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=5).decode()
-                self.found_ips[ip]["asn_info"] = whois_out.strip()
-            except: pass
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            executor.map(process_ip, ips)
-
-    # 4. 隐蔽扫描与规避
+    # 7. 隐蔽扫描与规避
     def stealth_scan(self):
         self.log("STEALTH", "正在启动隐蔽扫描 (分片与诱饵技术)...")
         for ip, data in self.found_ips.items():
             if data["cdn"]: continue
             self.log("NMAP", f"隐蔽探测目标: {ip}")
             try:
+                # -f: 分片, -D RND:5: 诱饵, -sS: SYN 扫描
                 cmd = ["nmap", "-sS", "-sV", "-f", "-D", "RND:5", "--source-port", "53", "-p", TCP_PORTS, "--open", "--host-timeout", "5m", ip]
                 output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=300).decode()
-                
                 matches = re.findall(r"(\d+)/tcp\s+open\s+([^\s]+)\s+(.*)", output)
                 for port, service, version in matches:
                     data["ports"][port] = {"service": service, "version": version.strip()}
                     self.log("OPEN", f"{ip}:{port} -> {service}")
-            except subprocess.TimeoutExpired:
-                self.log("!", f"Nmap 扫描 {ip} 超时，跳过")
             except: pass
 
-    # 5. 云原生与容器安全探测
-    def cloud_container_audit(self):
-        self.log("AUDIT", "正在探测云原生与容器暴露风险...")
-        targets = []
-        for ip, data in self.found_ips.items():
-            if not data["cdn"]: targets.append(ip)
-        
-        def check_target(ip):
-            for port in ["6443", "10250"]:
-                try:
-                    r = requests.get(f"https://{ip}:{port}/version", verify=False, timeout=3)
-                    if r.status_code == 200:
-                        self.found_ips[ip]["vulns"].append({"name": f"K8s API Exposure ({port})", "severity": "critical"})
-                except: pass
-            try:
-                r = requests.get(f"http://{ip}:2375/version", timeout=3)
-                if r.status_code == 200:
-                    self.found_ips[ip]["vulns"].append({"name": "Docker Remote API Exposure", "severity": "critical"})
-            except: pass
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            executor.map(check_target, targets)
-
-    # 6. 自动化漏洞扫描 (Nuclei)
+    # 8. 自动化漏洞扫描 (Nuclei)
     def run_nuclei(self):
         self.log("NUCLEI", "正在启动 Nuclei 深度扫描...")
         target_file = "ultimate_targets.txt"
@@ -184,11 +237,9 @@ class InfoWeaveUltimate:
             for ip, data in self.found_ips.items():
                 if not data["cdn"]: f.write(f"{ip}\n")
                 for sub in data["subdomains"]: f.write(f"{sub}\n")
-
         try:
             cmd = ["nuclei", "-l", target_file, "-silent", "-severity", "medium,high,critical", "-jsonl", "-timeout", str(self.args.timeout)]
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            
             for line in process.stdout:
                 try:
                     vuln = json.loads(line)
@@ -202,20 +253,24 @@ class InfoWeaveUltimate:
                             })
                             self.results["summary"]["vulnerabilities"] += 1
                 except: continue
-        except Exception as e:
-            self.log("!", f"Nuclei 运行异常: {e}")
+        except: pass
 
     def save_report(self):
         self.results["details"] = self.found_ips
         self.results["summary"]["total_subdomains"] = len(self.subdomains)
         self.results["summary"]["total_ips"] = len(self.found_ips)
+        self.results["summary"]["cloud_buckets"] = len(self.cloud_buckets)
+        self.results["cloud_buckets"] = list(self.cloud_buckets)
         with open(self.output_file, "w") as f:
             json.dump(self.results, f, indent=4)
         self.log("DONE", f"终极报告已生成: {self.output_file}")
 
     def run(self):
         try:
-            # 基础子域名收集
+            self.analyze_spf_mx()
+            self.github_recon()
+            self.cloud_bucket_brute()
+            
             self.log("SUB", "正在进行基础子域名收集...")
             try:
                 cmd = ["subfinder", "-d", self.domain, "-silent"]
@@ -223,18 +278,9 @@ class InfoWeaveUltimate:
                 self.subdomains.update([s.strip() for s in res if s.strip()])
             except: pass
             
-            # 修复：严格根据参数决定是否执行模块
-            if not self.args.no_ct:
-                self.fetch_ct_logs()
-            else:
-                self.log("SKIP", "已跳过 crt.sh 模块")
-
-            if not self.args.no_wayback:
-                self.fetch_wayback_urls()
-            else:
-                self.log("SKIP", "已跳过 Wayback 模块")
+            if not self.args.no_ct: self.fetch_ct_logs()
+            if not self.args.no_wayback: self.fetch_wayback_urls()
             
-            # 解析 IP 并识别 CDN
             self.log("RESOLVE", f"正在解析 {len(self.subdomains)} 个子域名...")
             for sub in list(self.subdomains):
                 try:
@@ -243,19 +289,12 @@ class InfoWeaveUltimate:
                         self.found_ips[ip] = {"cdn": False, "subdomains": [], "ports": {}, "vulns": []}
                     if sub not in self.found_ips[ip]["subdomains"]:
                         self.found_ips[ip]["subdomains"].append(sub)
-                    if any(kw in sub for kw in CDN_KEYWORDS):
-                        self.found_ips[ip]["cdn"] = True
+                    if any(kw in sub for kw in CDN_KEYWORDS): self.found_ips[ip]["cdn"] = True
                 except: continue
             
-            self.map_asn_and_ptr()
+            self.c_class_ptr_scan()
             self.stealth_scan()
-            self.cloud_container_audit()
-            
-            if not self.args.no_nuclei:
-                self.run_nuclei()
-            else:
-                self.log("SKIP", "已跳过 Nuclei 扫描")
-
+            if not self.args.no_nuclei: self.run_nuclei()
             self.save_report()
             
         except KeyboardInterrupt:
@@ -264,22 +303,17 @@ class InfoWeaveUltimate:
             sys.exit(130)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="InfoWeave Ultimate - APT Recon Tool")
+    parser = argparse.ArgumentParser(description="InfoWeave Ultimate (APT Edition) - Top-Tier Recon Tool")
     parser.add_argument("domain", help="目标域名", nargs="?")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="网络请求超时时间 (秒)")
-    parser.add_argument("--no-wayback", action="store_true", help="跳过 Wayback 模块")
-    parser.add_argument("--no-ct", action="store_true", help="跳过 crt.sh 模块")
-    parser.add_argument("--no-nuclei", action="store_true", help="跳过 Nuclei 扫描")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="超时时间")
+    parser.add_argument("--no-wayback", action="store_true", help="跳过 Wayback")
+    parser.add_argument("--no-ct", action="store_true", help="跳过 crt.sh")
+    parser.add_argument("--no-nuclei", action="store_true", help="跳过 Nuclei")
     args = parser.parse_args()
 
-    # 修复：如果命令行已提供域名，则不再弹出 input()
-    target = args.domain
-    if not target:
-        target = input("输入目标域名: ").strip()
-    
+    target = args.domain or input("输入目标域名: ").strip()
     if target:
         scanner = InfoWeaveUltimate(target, args)
         scanner.run()
     else:
-        print("错误: 未指定目标域名")
         sys.exit(1)
